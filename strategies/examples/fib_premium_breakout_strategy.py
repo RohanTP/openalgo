@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime
 
+import sys
 import pandas as pd  # type: ignore[reportMissingImports]
 from openalgo import api  # type: ignore[reportMissingImports]
 
@@ -57,7 +58,7 @@ WS_URL = os.getenv("WEBSOCKET_URL") or (
     f"ws://{os.getenv('WEBSOCKET_HOST', '127.0.0.1')}:{os.getenv('WEBSOCKET_PORT', '8765')}"
 )
 
-if not API_KEY:
+if not API_KEY and (__name__ == "__main__" or (len(sys.argv) > 1 and "live" in sys.argv)):
     print("Error: OPENALGO_API_KEY environment variable not set")
     raise SystemExit(1)
 
@@ -91,7 +92,9 @@ ALLOW_BOTH_CE_PE = env_bool("ALLOW_BOTH_CE_PE", True)
 ONE_TRADE_PER_DAY = env_bool("ONE_TRADE_PER_DAY", True)
 POLL_SECONDS = env_int("POLL_SECONDS", 15)
 
-client = api(api_key=API_KEY, host=HOST, ws_url=WS_URL)
+client = None
+if API_KEY:
+    client = api(api_key=API_KEY, host=HOST, ws_url=WS_URL)
 
 
 @dataclass
@@ -102,6 +105,7 @@ class Candidate:
     label: str
     strike: float
     lotsize: int
+    expiry: str | None = None
 
 
 @dataclass
@@ -110,11 +114,101 @@ class TradePlan:
     entry: float
     stop_loss: float
     targets: list[float]
-    remaining_qty: int
-    target_quantities: list[int]
+    remaining_lot: int
+    target_lots: list[int]
     booked_targets: set[int] = field(default_factory=set)
     active_stop_loss: float = 0.0
     entered: bool = False
+    entry_price: float | None = None
+    entry_time: datetime | None = None
+    plan_id: str | None = None
+
+
+class OrderExecutor:
+    def place_order(
+        self,
+        plan: TradePlan,
+        action: str,
+        quantity: int,
+        position_size: int,
+        price: float | None = None,
+        ts: datetime | None = None,
+        reason: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+
+class LiveOrderExecutor(OrderExecutor):
+    def place_order(
+        self,
+        plan: TradePlan,
+        action: str,
+        quantity: int,
+        position_size: int,
+        price: float | None = None,
+        ts: datetime | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if client is None:
+            raise RuntimeError("API client is not initialized.")
+        response = client.placesmartorder(
+            strategy=STRATEGY_NAME,
+            symbol=plan.candidate.symbol,
+            action=action,
+            exchange=DERIVATIVE_EXCHANGE,
+            price_type="MARKET",
+            product=PRODUCT,
+            quantity=quantity,
+            position_size=position_size,
+        )
+        print(f"{action} {quantity} {plan.candidate.symbol} response:", response)
+
+
+class BacktestOrderExecutor(OrderExecutor):
+    def __init__(self) -> None:
+        self.orders: list[dict] = []
+
+    def place_order(
+        self,
+        plan: TradePlan,
+        action: str,
+        quantity: int,
+        position_size: int,
+        price: float | None = None,
+        ts: datetime | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if action == "BUY":
+            if plan.entry_price is None:
+                plan.entry_price = price if price is not None else plan.entry
+            if plan.entry_time is None:
+                plan.entry_time = ts
+
+        pnl = 0.0
+        if action == "SELL":
+            entry_p = plan.entry_price if plan.entry_price is not None else plan.entry
+            sell_p = price if price is not None else entry_p
+            pnl = round((sell_p - entry_p) * quantity, 2)
+
+        order_row = {
+            "plan_id": getattr(plan, "plan_id", None),
+            "symbol": plan.candidate.symbol,
+            "option_type": plan.candidate.option_type,
+            "strike": plan.candidate.strike,
+            "expiry": getattr(plan.candidate, "expiry", None),
+            "action": action,
+            "quantity": quantity,
+            "lots": quantity // plan.candidate.lotsize,
+            "price": price if price is not None else (plan.entry if action == "BUY" else plan.active_stop_loss),
+            "position_size": position_size,
+            "reason": reason,
+            "remaining_lots": plan.remaining_lot,
+            "remaining_quantity": plan.remaining_lot * plan.candidate.lotsize,
+            "entry_price": plan.entry_price,
+            "realized_pnl": pnl,
+            "timestamp": ts,
+        }
+        self.orders.append(order_row)
 
 
 def parse_expiry_date(expiry: str) -> datetime:
@@ -252,6 +346,25 @@ def fetch_today_history(symbol: str) -> pd.DataFrame:
         raise KeyError(f"{symbol} history missing columns: {missing_columns}")
     return df
 
+def fetch_ltp(symbol: str) -> float:
+    response = client.quotes(
+        symbol=symbol,
+        exchange=DERIVATIVE_EXCHANGE,
+    )
+
+    if response.get("status") != "success":
+        raise RuntimeError(
+            f"Failed to fetch LTP for {symbol}: {response.get('message')}"
+        )
+
+    data = response.get("data", {})
+
+    for key in ("ltp", "LTP", "last_price", "lastPrice", "close"):
+        value = data.get(key)
+        if value not in (None, ""):
+            return float(value)
+
+    raise KeyError(f"LTP not found in quote response for {symbol}")
 
 def completed_candles(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < 2:
@@ -264,8 +377,8 @@ def reference_candle(df: pd.DataFrame) -> pd.Series | None:
     if candles.empty:
         return None
 
-    today = datetime.now().date()
-    day_candles = candles[candles.index.date == today]
+    first_date = candles.index[0].date()
+    day_candles = candles[candles.index.date == first_date]
     day_candles = day_candles[day_candles.index.time >= REFERENCE_CANDLE_TIME]
     if day_candles.empty:
         return None
@@ -284,26 +397,21 @@ def build_stop_loss(low: float, high: float) -> float:
     return round(low - SL_BUFFER, 2)
 
 
-def split_target_quantities(total_qty: int, lot_size: int) -> list[int]:
-    quantities: list[int] = []
+def split_target_lots(total_lots: int) -> list[int]:
+    lots: list[int] = []
     allocated = 0
 
     for index, pct in enumerate(BOOKING_PCTS):
         if index == len(BOOKING_PCTS) - 1:
-            qty = total_qty - allocated
+            lot_count = total_lots - allocated
         else:
-            raw_qty = int(total_qty * pct / 100)
-            qty = (raw_qty // lot_size) * lot_size
-            if qty == 0 and total_qty - allocated >= lot_size:
-                qty = lot_size
-        qty = max(0, min(qty, total_qty - allocated))
-        quantities.append(qty)
-        allocated += qty
+            lot_count = round(total_lots * pct / 100)
+            lot_count = max(0, min(lot_count, total_lots - allocated))
 
-    if allocated < total_qty and quantities:
-        quantities[-1] += total_qty - allocated
+        lots.append(lot_count)
+        allocated += lot_count
 
-    return quantities
+    return lots
 
 
 def create_trade_plans(candidates: list[Candidate]) -> list[TradePlan]:
@@ -318,16 +426,15 @@ def create_trade_plans(candidates: list[Candidate]) -> list[TradePlan]:
         high = round(float(candle["high"]), 2)
         low = round(float(candle["low"]), 2)
         candle_range = round(high - low, 2)
-        total_qty = TOTAL_LOTS * candidate.lotsize
-        target_quantities = split_target_quantities(total_qty, candidate.lotsize)
+        target_lots = split_target_lots(TOTAL_LOTS)
 
         plan = TradePlan(
             candidate=candidate,
             entry=round(high + ENTRY_BUFFER, 2),
             stop_loss=build_stop_loss(low, high),
             targets=build_targets(low, high),
-            remaining_qty=total_qty,
-            target_quantities=target_quantities,
+            remaining_lot=TOTAL_LOTS,
+            target_lots = target_lots
         )
         plan.active_stop_loss = plan.stop_loss
         plans.append(plan)
@@ -357,37 +464,56 @@ def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     return ha
 
 
-def place_order(plan: TradePlan, action: str, quantity: int, position_size: int) -> None:
-    response = client.placesmartorder(
-        strategy=STRATEGY_NAME,
-        symbol=plan.candidate.symbol,
-        action=action,
-        exchange=DERIVATIVE_EXCHANGE,
-        price_type="MARKET",
-        product=PRODUCT,
+def enter_trade(
+    plan: TradePlan,
+    order_executor: OrderExecutor,
+    price: float | None = None,
+    ts: datetime | None = None,
+) -> None:
+    quantity = plan.remaining_lot * plan.candidate.lotsize
+    order_executor.place_order(
+        plan,
+        action="BUY",
         quantity=quantity,
-        position_size=position_size,
+        position_size=quantity,
+        price=price,
+        ts=ts,
+        reason="ENTRY",
     )
-    print(f"{action} {quantity} {plan.candidate.symbol} response:", response)
-
-
-def enter_trade(plan: TradePlan) -> None:
-    place_order(plan, action="BUY", quantity=plan.remaining_qty, position_size=plan.remaining_qty)
     plan.entered = True
     print(
-        f"Entered BUY {plan.candidate.symbol} qty={plan.remaining_qty} "
-        f"entry={plan.entry} sl={plan.active_stop_loss} targets={plan.targets}"
+        f"Entered BUY {plan.candidate.symbol} qty={quantity} lots={plan.remaining_lot} "
+        f"entry={price if price is not None else plan.entry} sl={plan.active_stop_loss} targets={plan.targets}"
     )
 
 
-def exit_quantity(plan: TradePlan, quantity: int, reason: str) -> None:
-    if quantity <= 0 or plan.remaining_qty <= 0:
+def exit_quantity(
+    plan: TradePlan,
+    lot: int,
+    reason: str,
+    order_executor: OrderExecutor,
+    price: float | None = None,
+    ts: datetime | None = None,
+) -> None:
+    if lot <= 0 or plan.remaining_lot <= 0:
         return
-
-    quantity = min(quantity, plan.remaining_qty)
-    plan.remaining_qty -= quantity
-    place_order(plan, action="SELL", quantity=quantity, position_size=plan.remaining_qty)
-    print(f"Exited {quantity} {plan.candidate.symbol} due to {reason}. Remaining={plan.remaining_qty}")
+    lot = min(lot, plan.remaining_lot)
+    plan.remaining_lot -= lot
+    quantity = lot * plan.candidate.lotsize
+    remaining_qty = plan.remaining_lot * plan.candidate.lotsize
+    order_executor.place_order(
+        plan,
+        action="SELL",
+        quantity=quantity,
+        position_size=remaining_qty,
+        price=price,
+        ts=ts,
+        reason=reason,
+    )
+    print(
+        f"Exited {quantity}(lot {lot}) {plan.candidate.symbol} due to {reason}. "
+        f"Remaining={remaining_qty}(lot {plan.remaining_lot})"
+    )
 
 
 def update_heikin_ashi_stop(plan: TradePlan, df: pd.DataFrame) -> None:
@@ -401,41 +527,91 @@ def update_heikin_ashi_stop(plan: TradePlan, df: pd.DataFrame) -> None:
     plan.active_stop_loss = max(plan.active_stop_loss, trailed_sl)
 
 
-def monitor_plan(plan: TradePlan) -> bool:
+def handle_plan(
+    plan: TradePlan,
+    candle: pd.Series,
+    ltp: float,
+    ts: datetime,
+    order_executor: OrderExecutor,
+    history_df: pd.DataFrame | None = None,
+    is_backtest: bool = False,
+) -> bool:
+    if not plan.entered:
+        use_buffer = is_backtest or env_bool("LIVE_ENTRY_BUFFER_ENABLED", True)
+        entry_trigger_buffer = env_float("ENTRY_TRIGGER_BUFFER", 5.0)
+
+        should_enter = False
+        if use_buffer:
+            if plan.entry <= ltp <= plan.entry + entry_trigger_buffer:
+                should_enter = True
+        else:
+            if ltp >= plan.entry:
+                should_enter = True
+
+        if should_enter:
+            enter_price = plan.entry
+            enter_trade(plan, order_executor, price=enter_price, ts=ts)
+
+    if plan.entered:
+        if history_df is not None:
+            update_heikin_ashi_stop(plan, history_df)
+
+        for index, target in enumerate(plan.targets):
+            if index in plan.booked_targets:
+                continue
+
+            if ltp >= target:
+                lot = plan.target_lots[index] if index < len(plan.target_lots) else 0
+                exit_price = target
+                exit_quantity(
+                    plan,
+                    lot,
+                    reason=f"fib target {target}",
+                    order_executor=order_executor,
+                    price=exit_price,
+                    ts=ts,
+                )
+                plan.booked_targets.add(index)
+
+        latest_close = float(candle["close"])
+        if latest_close <= plan.active_stop_loss:
+            exit_price = plan.active_stop_loss
+            exit_quantity(
+                plan,
+                plan.remaining_lot,
+                reason=f"SL close beyond {plan.active_stop_loss}",
+                order_executor=order_executor,
+                price=exit_price,
+                ts=ts,
+            )
+
+        if plan.remaining_lot > 0:
+            print(
+                f"{plan.candidate.symbol} close={latest_close:.2f} "
+                f"active_sl={plan.active_stop_loss:.2f} remaining={plan.remaining_lot}"
+            )
+
+    return plan.entered
+
+
+def monitor_plan(plan: TradePlan, order_executor: OrderExecutor) -> bool:
     df = fetch_today_history(plan.candidate.symbol)
     candles = completed_candles(df)
     if candles.empty:
         return False
 
     latest = candles.iloc[-1]
-    latest_high = float(latest["high"])
-    latest_close = float(latest["close"])
+    ltp = fetch_ltp(plan.candidate.symbol)
 
-    if not plan.entered:
-        if latest_high >= plan.entry:
-            enter_trade(plan)
-            return True
-        return False
-
-    update_heikin_ashi_stop(plan, df)
-
-    for index, target in enumerate(plan.targets):
-        if index in plan.booked_targets:
-            continue
-
-        if latest_high >= target:
-            quantity = plan.target_quantities[index] if index < len(plan.target_quantities) else 0
-            exit_quantity(plan, quantity, reason=f"fib target {target}")
-            plan.booked_targets.add(index)
-
-    if latest_close <= plan.active_stop_loss:
-        exit_quantity(plan, plan.remaining_qty, reason=f"SL close beyond {plan.active_stop_loss}")
-
-    print(
-        f"{plan.candidate.symbol} close={latest_close:.2f} "
-        f"active_sl={plan.active_stop_loss:.2f} remaining={plan.remaining_qty}"
+    return handle_plan(
+        plan=plan,
+        candle=latest,
+        ltp=ltp,
+        ts=latest.name if hasattr(latest, "name") else datetime.now(),
+        order_executor=order_executor,
+        history_df=df,
+        is_backtest=False,
     )
-    return plan.entered
 
 
 def wait_until(target_time: dtime) -> None:
@@ -465,12 +641,13 @@ def run_strategy() -> None:
         return
 
     any_trade_entered = False
+    live_executor = LiveOrderExecutor()
     while datetime.now().time() <= SQUARE_OFF_TIME:
         if datetime.now().time() > TRADE_END_TIME and not any(plan.entered for plan in plans):
             print("Trade window ended with no entry")
             return
 
-        active_plans = [plan for plan in plans if plan.remaining_qty > 0]
+        active_plans = [plan for plan in plans if plan.remaining_lot > 0]
         if not active_plans:
             print("All plans completed")
             return
@@ -478,14 +655,20 @@ def run_strategy() -> None:
         for plan in active_plans:
             if ONE_TRADE_PER_DAY and any_trade_entered and not plan.entered:
                 continue
-            entered_now_or_before = monitor_plan(plan)
+            entered_now_or_before = monitor_plan(plan, live_executor)
             any_trade_entered = any_trade_entered or entered_now_or_before
 
         time.sleep(POLL_SECONDS)
 
     for plan in plans:
-        if plan.entered and plan.remaining_qty > 0:
-            exit_quantity(plan, plan.remaining_qty, reason="square off time")
+        if plan.entered and plan.remaining_lot > 0:
+            exit_quantity(
+                plan,
+                plan.remaining_lot,
+                reason="square off time",
+                order_executor=live_executor,
+                ts=datetime.now(),
+            )
 
 
 if __name__ == "__main__":

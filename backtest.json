@@ -1,0 +1,36 @@
+[
+  {
+    "name": "nifty_may_2023_test",
+    "instrument": "NIFTY",
+    "options_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/options/NIFTY",
+    "index_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/index/NIFTY.parquet",
+    "weeks": [
+      {
+        "start": "2023-05-08",
+        "end": "2023-05-12",
+        "expiry": "2023-05-11"
+      }
+    ],
+    "output_dir": "./backtest_results",
+
+    "SELECT_TIME": "09:07",
+    "REFERENCE_CANDLE_TIME": "09:15",
+    "TRADE_END_TIME": "10:30",
+    "SQUARE_OFF_TIME": "15:15",
+
+    "PREMIUM_MIN": 300,
+    "PREMIUM_MAX": 400,
+    "PREMIUM_TARGET": 350,
+    "TOTAL_LOTS": 4,
+    "LOT_SIZE": 75,
+    "BIG_CANDLE_THRESHOLD": 40,
+    "BIG_CANDLE_SL_FIB": 0.55,
+    "ENTRY_BUFFER": 0.05,
+    "ENTRY_TRIGGER_BUFFER": 5,
+    "SL_BUFFER": 0.5,
+    "FIB_TARGETS": [1.272, 1.618, 2.0],
+    "BOOKING_PCTS": [40, 30, 30],
+    "ALLOW_BOTH_CE_PE": true,
+    "ONE_TRADE_PER_DAY": false
+  }
+]
