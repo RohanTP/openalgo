@@ -56,12 +56,21 @@ def apply_config_to_strategy(config: dict) -> None:
             setattr(strat, bool_key, bool(config[bool_key]))
 
 class back_test:
-    def __init__(self,config: dict, conn: duckdb.DuckDBPyConnection):
+    def __init__(self, config: dict, conn: duckdb.DuckDBPyConnection):
         self.test_name = config["name"]
         self.instrument = config["instrument"]
         self.options_parquet = config["options_parquet"]
         self.index_parquet = config["index_parquet"]
-        self.range = config["range"]
+        self.conn = conn
+
+        # Date range from config
+        ranges = config.get("range", [])
+        if ranges:
+            self.start_date = ranges[0]["start"]
+            self.end_date = ranges[0]["end"]
+        else:
+            self.start_date = "1900-01-01"
+            self.end_date = "9999-12-31"
 
         # Strategy settings
         self.premium_min = config.get("PREMIUM_MIN", 300)
@@ -109,12 +118,13 @@ class back_test:
     def get_trading_days_for_expiry(
             self,
             options_path: str,
-            expiry_date: str,
+            expiry_date,
         ) -> list[str]:
+            expiry_str = expiry_date.strftime("%Y-%m-%d") if hasattr(expiry_date, "strftime") else str(expiry_date)[:10]
             query = f"""
                 SELECT DISTINCT trading_day
                 FROM '{options_path}'
-                WHERE expiry = DATE '{expiry_date}'
+                WHERE expiry = '{expiry_str}'
                 ORDER BY trading_day
             """
 
@@ -130,8 +140,8 @@ class back_test:
             SELECT close
             FROM '{self.index_parquet}'
             WHERE symbol = '{self.instrument}'
-            AND trading_day = DATE '{trading_day}'
-            AND strftime(timestamp, '%H:%M') = '{self.select_time_str}'
+            AND trading_day = '{trading_day}'
+            AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) = '{self.select_time_str}'
             LIMIT 1
         """
 
@@ -157,9 +167,9 @@ class back_test:
                 query = f"""
                     SELECT symbol, strike, option_type, close AS premium
                     FROM '{options_path}'
-                    WHERE expiry = DATE '{expiry_date_str}'
-                    AND trading_day = DATE '{trading_day}'
-                    AND strftime(timestamp, '%H:%M') = '{t_str}'
+                    WHERE expiry = '{expiry_date_str}'
+                    AND trading_day = '{trading_day}'
+                    AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) = '{t_str}'
                     AND close >= {self.premium_min}
                     AND close <= {self.premium_max}
                 """
@@ -256,8 +266,8 @@ class back_test:
                 SELECT symbol, strike, option_type, timestamp, open, high, low, close
                 FROM '{options_path}'
                 WHERE symbol IN ({symbols_str})
-                AND trading_day = DATE '{trading_day}'
-                AND strftime(timestamp, '%H:%M') = '{self.ref_time_str}'
+                AND trading_day = '{trading_day}'
+                AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) = '{self.ref_time_str}'
             """
 
             ref_df = self.conn.execute(query).df()
@@ -321,12 +331,12 @@ class back_test:
             )
 
             query = f"""
-                SELECT timestamp, symbol, strike, option_type, open, high, low, close
+                SELECT timezone('Asia/Kolkata', timestamp) AS timestamp, symbol, strike, option_type, open, high, low, close
                 FROM '{options_path}'
                 WHERE symbol IN ({symbols_str})
-                AND trading_day = DATE '{trading_day}'
-                AND strftime(timestamp, '%H:%M') >= '09:00'
-                AND strftime(timestamp, '%H:%M') <= '{self.square_off_time_str}'
+                AND trading_day = '{trading_day}'
+                AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) >= '09:00'
+                AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) <= '{self.square_off_time_str}'
                 ORDER BY timestamp
             """
 
@@ -670,7 +680,7 @@ class back_test:
 
             days = self.get_trading_days_for_expiry(
                 options_path=options_path,
-                expiry_date=expiry_date
+                expiry_date=expiry_date_str,
             )
 
             if not days:
@@ -707,9 +717,9 @@ def main() -> None:
         
         # Apply config parameters to strat module
         apply_config_to_strategy(config)
-        bt = back_test(config,conn)
-        
-        plans, orders, skipped_days = bt.run_back_test(config, conn)
+        bt = back_test(config, conn)
+
+        plans, orders, skipped_days = bt.run_back_test()
         
         # Save output files
         output_dir = config.get("output_dir", "./backtest_results")
