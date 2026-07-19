@@ -35,25 +35,34 @@ def apply_config_to_strategy(config: dict) -> None:
         if time_key in config:
             setattr(strat, time_key, datetime.strptime(config[time_key], "%H:%M").time())
             
-    # Float/Int parameters
-    for num_key in [
-        "PREMIUM_MIN", "PREMIUM_MAX", "PREMIUM_TARGET", "TOTAL_LOTS", "LOT_SIZE",
+    # Float parameters
+    for float_key in [
+        "PREMIUM_MIN", "PREMIUM_MAX",
         "BIG_CANDLE_THRESHOLD", "BIG_CANDLE_SL_FIB", "ENTRY_BUFFER", "SL_BUFFER",
-        "ENTRY_TRIGGER_BUFFER"
+        "ENTRY_TRIGGER_BUFFER",
     ]:
-        if num_key in config:
-            setattr(strat, num_key, float(config[num_key]))
-            
+        if float_key in config:
+            setattr(strat, float_key, float(config[float_key]))
+
+    # Int parameters
+    for int_key in ["TOTAL_LOTS", "LOT_SIZE", "HA_TRAIL_START_TARGET", "HA_TRAIL_DELAY_MINUTES"]:
+        if int_key in config:
+            setattr(strat, int_key, int(config[int_key]))
+
     # Lists
     if "FIB_TARGETS" in config:
         strat.FIB_TARGETS = [float(x) for x in config["FIB_TARGETS"]]
     if "BOOKING_PCTS" in config:
         strat.BOOKING_PCTS = [int(x) for x in config["BOOKING_PCTS"]]
-        
+
     # Bools
     for bool_key in ["ALLOW_BOTH_CE_PE", "ONE_TRADE_PER_DAY"]:
         if bool_key in config:
             setattr(strat, bool_key, bool(config[bool_key]))
+
+    # String parameters
+    if "STRATEGY_LOG_LEVEL" in config:
+        strat._LOG_LEVEL = str(config["STRATEGY_LOG_LEVEL"]).upper()
 
 class back_test:
     def __init__(self, config: dict, conn: duckdb.DuckDBPyConnection):
@@ -75,7 +84,6 @@ class back_test:
         # Strategy settings
         self.premium_min = config.get("PREMIUM_MIN", 300)
         self.premium_max = config.get("PREMIUM_MAX", 400)
-        self.premium_target = config.get("PREMIUM_TARGET", (self.premium_min + self.premium_max) / 2)
         self.total_lots = config.get("TOTAL_LOTS", 4)
         self.entry_buffer = config.get("ENTRY_BUFFER", 0.05)
         self.select_time_str = config.get("SELECT_TIME", "09:07")
@@ -237,7 +245,7 @@ class back_test:
                     selected.append(
                         min(
                             typed,
-                            key=lambda c: abs(c.premium - self.premium_target),
+                            key=lambda c: c.premium,
                         )
                     )
 
@@ -245,7 +253,7 @@ class back_test:
                 selected = [
                     min(
                         selected,
-                        key=lambda c: abs(c.premium - self.premium_target),
+                        key=lambda c: c.premium,
                     )
                 ]
 
@@ -626,9 +634,14 @@ class back_test:
         if not plan_orders:
             return "COMPLETED"
 
-        last_reason = str(plan_orders[-1].get("reason", "")).lower()
+        last_order = plan_orders[-1]
+        last_reason = str(last_order.get("reason", "")).lower()
 
         if "sl" in last_reason or "stop" in last_reason:
+            last_exit_price = float(last_order.get("price") or 0)
+            entry_price = float(last_order.get("entry_price") or 0)
+            if entry_price > 0 and last_exit_price > entry_price:
+                return "TRAILING_SL"
             return "STOPLOSS"
 
         if "square" in last_reason:

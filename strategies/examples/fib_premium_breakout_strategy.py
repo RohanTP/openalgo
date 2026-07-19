@@ -76,7 +76,6 @@ SQUARE_OFF_TIME = env_time("SQUARE_OFF_TIME", "15:15")
 
 PREMIUM_MIN = env_float("PREMIUM_MIN", 300.0)
 PREMIUM_MAX = env_float("PREMIUM_MAX", 400.0)
-PREMIUM_TARGET = env_float("PREMIUM_TARGET", (PREMIUM_MIN + PREMIUM_MAX) / 2)
 STRIKE_COUNT = env_int("STRIKE_COUNT", 30)
 
 TOTAL_LOTS = env_int("TOTAL_LOTS", 4)
@@ -91,6 +90,20 @@ BOOKING_PCTS = env_int_list("BOOKING_PCTS", "25,25,50")
 ALLOW_BOTH_CE_PE = env_bool("ALLOW_BOTH_CE_PE", True)
 ONE_TRADE_PER_DAY = env_bool("ONE_TRADE_PER_DAY", True)
 POLL_SECONDS = env_int("POLL_SECONDS", 15)
+
+# HA trail activation: wait for target N hit and/or N minutes after entry (0 = disabled)
+HA_TRAIL_START_TARGET = env_int("HA_TRAIL_START_TARGET", 0)
+HA_TRAIL_DELAY_MINUTES = env_int("HA_TRAIL_DELAY_MINUTES", 0)
+
+_LOG_LEVEL = os.getenv("STRATEGY_LOG_LEVEL", "INFO").upper()  # DISABLED | INFO | DEBUG
+
+
+def log(msg: str, level: str = "INFO") -> None:
+    if _LOG_LEVEL == "DISABLED":
+        return
+    if _LOG_LEVEL == "INFO" and level == "DEBUG":
+        return
+    print(msg)
 
 client = None
 if API_KEY:
@@ -122,6 +135,7 @@ class TradePlan:
     entry_price: float | None = None
     entry_time: datetime | None = None
     plan_id: str | None = None
+    ha_trail_active: bool = False
 
 
 class OrderExecutor:
@@ -161,7 +175,7 @@ class LiveOrderExecutor(OrderExecutor):
             quantity=quantity,
             position_size=position_size,
         )
-        print(f"{action} {quantity} {plan.candidate.symbol} response:", response)
+        log(f"{action} {quantity} {plan.candidate.symbol} response: {response}", "DEBUG")
 
 
 class BacktestOrderExecutor(OrderExecutor):
@@ -298,17 +312,17 @@ def select_option_candidates() -> list[Candidate]:
         if is_expiry_day:
             selected.append(min(typed, key=lambda candidate: candidate.premium))
         else:
-            selected.append(min(typed, key=lambda candidate: abs(candidate.premium - PREMIUM_TARGET)))
+            selected.append(min(typed, key=lambda candidate: candidate.premium))
 
     if not ALLOW_BOTH_CE_PE and selected:
-        selected = [min(selected, key=lambda candidate: abs(candidate.premium - PREMIUM_TARGET))]
+        selected = [min(selected, key=lambda candidate: abs(candidate.premium))]
 
-    print(f"Selected expiry: {expiry} | Expiry day: {is_expiry_day}")
+    log(f"Selected expiry: {expiry} | Expiry day: {is_expiry_day}", "INFO")
     for candidate in selected:
-        print(
-            "Selected "
-            f"{candidate.option_type}: {candidate.symbol} "
-            f"premium={candidate.premium} label={candidate.label} strike={candidate.strike}"
+        log(
+            f"Selected {candidate.option_type}: {candidate.symbol} "
+            f"premium={candidate.premium} label={candidate.label} strike={candidate.strike}",
+            "INFO",
         )
     return selected
 
@@ -420,7 +434,7 @@ def create_trade_plans(candidates: list[Candidate]) -> list[TradePlan]:
         df = fetch_today_history(candidate.symbol)
         candle = reference_candle(df)
         if candle is None:
-            print(f"Waiting for reference candle for {candidate.symbol}")
+            log(f"Waiting for reference candle for {candidate.symbol}", "INFO")
             continue
 
         high = round(float(candle["high"]), 2)
@@ -439,9 +453,10 @@ def create_trade_plans(candidates: list[Candidate]) -> list[TradePlan]:
         plan.active_stop_loss = plan.stop_loss
         plans.append(plan)
 
-        print(
+        log(
             f"{candidate.symbol} reference high={high} low={low} range={candle_range} "
-            f"entry={plan.entry} sl={plan.stop_loss} targets={plan.targets}"
+            f"entry={plan.entry} sl={plan.stop_loss} targets={plan.targets}",
+            "INFO",
         )
 
     return plans
@@ -481,9 +496,10 @@ def enter_trade(
         reason="ENTRY",
     )
     plan.entered = True
-    print(
+    log(
         f"Entered BUY {plan.candidate.symbol} qty={quantity} lots={plan.remaining_lot} "
-        f"entry={price if price is not None else plan.entry} sl={plan.active_stop_loss} targets={plan.targets}"
+        f"entry={price if price is not None else plan.entry} sl={plan.active_stop_loss} targets={plan.targets}",
+        "INFO",
     )
 
 
@@ -510,13 +526,23 @@ def exit_quantity(
         ts=ts,
         reason=reason,
     )
-    print(
+    log(
         f"Exited {quantity}(lot {lot}) {plan.candidate.symbol} due to {reason}. "
-        f"Remaining={remaining_qty}(lot {plan.remaining_lot})"
+        f"Remaining={remaining_qty}(lot {plan.remaining_lot})",
+        "INFO",
     )
 
 
-def update_heikin_ashi_stop(plan: TradePlan, df: pd.DataFrame) -> None:
+def update_heikin_ashi_stop(plan: TradePlan, df: pd.DataFrame, ts: datetime | None = None) -> None:
+    if not plan.ha_trail_active:
+        target_hit = len(plan.booked_targets) >= HA_TRAIL_START_TARGET
+        delay_elapsed = (ts - plan.entry_time).total_seconds() / 60 >= HA_TRAIL_DELAY_MINUTES
+        if target_hit or delay_elapsed:
+            plan.ha_trail_active = True
+            log(f"{plan.candidate.symbol} HA trail activated at {ts} | target_hit={target_hit} delay_elapsed={delay_elapsed}", "INFO")
+        else:
+            return
+
     candles = completed_candles(df)
     if len(candles) < 2:
         return
@@ -524,7 +550,10 @@ def update_heikin_ashi_stop(plan: TradePlan, df: pd.DataFrame) -> None:
     ha = heikin_ashi(candles)
     previous_ha = ha.iloc[-2]
     trailed_sl = round(float(previous_ha["low"]) - SL_BUFFER, 2)
+    old_sl = plan.active_stop_loss
     plan.active_stop_loss = max(plan.active_stop_loss, trailed_sl)
+    if plan.active_stop_loss != old_sl:
+        log(f"{plan.candidate.symbol} HA trail SL updated {old_sl} -> {plan.active_stop_loss}", "DEBUG")
 
 
 def handle_plan(
@@ -554,7 +583,7 @@ def handle_plan(
 
     if plan.entered:
         if history_df is not None:
-            update_heikin_ashi_stop(plan, history_df)
+            update_heikin_ashi_stop(plan, history_df, ts=ts)
 
         for index, target in enumerate(plan.targets):
             if index in plan.booked_targets:
@@ -586,9 +615,10 @@ def handle_plan(
             )
 
         if plan.remaining_lot > 0:
-            print(
+            log(
                 f"{plan.candidate.symbol} close={latest_close:.2f} "
-                f"active_sl={plan.active_stop_loss:.2f} remaining={plan.remaining_lot}"
+                f"active_sl={plan.active_stop_loss:.2f} remaining={plan.remaining_lot}",
+                "DEBUG",
             )
 
     return plan.entered
@@ -616,15 +646,16 @@ def monitor_plan(plan: TradePlan, order_executor: OrderExecutor) -> bool:
 
 def wait_until(target_time: dtime) -> None:
     while datetime.now().time() < target_time:
-        print(f"Waiting for {target_time.strftime('%H:%M')}...")
+        log(f"Waiting for {target_time.strftime('%H:%M')}...", "DEBUG")
         time.sleep(min(POLL_SECONDS, 60))
 
 
 def run_strategy() -> None:
-    print(f"Starting {STRATEGY_NAME}")
-    print(
+    log(f"Starting {STRATEGY_NAME}", "INFO")
+    log(
         f"Underlying={UNDERLYING} index_exchange={INDEX_EXCHANGE} "
-        f"derivative_exchange={DERIVATIVE_EXCHANGE} product={PRODUCT}"
+        f"derivative_exchange={DERIVATIVE_EXCHANGE} product={PRODUCT}",
+        "INFO",
     )
 
     wait_until(SELECT_TIME)
@@ -637,19 +668,19 @@ def run_strategy() -> None:
             time.sleep(POLL_SECONDS)
 
     if not plans:
-        print("No reference candle plans created before trade end time")
+        log("No reference candle plans created before trade end time", "INFO")
         return
 
     any_trade_entered = False
     live_executor = LiveOrderExecutor()
     while datetime.now().time() <= SQUARE_OFF_TIME:
         if datetime.now().time() > TRADE_END_TIME and not any(plan.entered for plan in plans):
-            print("Trade window ended with no entry")
+            log("Trade window ended with no entry", "INFO")
             return
 
         active_plans = [plan for plan in plans if plan.remaining_lot > 0]
         if not active_plans:
-            print("All plans completed")
+            log("All plans completed", "INFO")
             return
 
         for plan in active_plans:
@@ -675,6 +706,6 @@ if __name__ == "__main__":
     try:
         run_strategy()
     except KeyboardInterrupt:
-        print("Strategy stopped")
+        log("Strategy stopped", "INFO")
     except Exception as exc:
-        print(f"Strategy error: {exc}")
+        log(f"Strategy error: {exc}", "INFO")
