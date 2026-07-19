@@ -89,7 +89,7 @@ FIB_TARGETS = env_float_list("FIB_TARGETS", "1.272,1.618,2.0")
 BOOKING_PCTS = env_int_list("BOOKING_PCTS", "25,25,50")
 ALLOW_BOTH_CE_PE = env_bool("ALLOW_BOTH_CE_PE", True)
 ONE_TRADE_PER_DAY = env_bool("ONE_TRADE_PER_DAY", True)
-POLL_SECONDS = env_int("POLL_SECONDS", 15)
+POLL_SECONDS = env_int("POLL_SECONDS", 3)
 
 # HA trail activation: wait for target N hit and/or N minutes after entry (0 = disabled)
 HA_TRAIL_START_TARGET = env_int("HA_TRAIL_START_TARGET", 0)
