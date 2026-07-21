@@ -84,6 +84,7 @@ BIG_CANDLE_THRESHOLD = env_float("BIG_CANDLE_THRESHOLD", 40.0)
 BIG_CANDLE_SL_FIB = env_float("BIG_CANDLE_SL_FIB", 0.55)
 ENTRY_BUFFER = env_float("ENTRY_BUFFER", 0.05)
 SL_BUFFER = env_float("SL_BUFFER", 0.05)
+ENTRY_TRIGGER_BUFFER = env_float("ENTRY_TRIGGER_BUFFER", 5.0)
 
 FIB_TARGETS = env_float_list("FIB_TARGETS", "1.272,1.618,2.0")
 BOOKING_PCTS = env_int_list("BOOKING_PCTS", "25,25,50")
@@ -567,11 +568,10 @@ def handle_plan(
 ) -> bool:
     if not plan.entered:
         use_buffer = is_backtest or env_bool("LIVE_ENTRY_BUFFER_ENABLED", True)
-        entry_trigger_buffer = env_float("ENTRY_TRIGGER_BUFFER", 5.0)
 
         should_enter = False
         if use_buffer:
-            if plan.entry <= ltp <= plan.entry + entry_trigger_buffer:
+            if plan.entry <= ltp <= plan.entry + ENTRY_TRIGGER_BUFFER:
                 should_enter = True
         else:
             if ltp >= plan.entry:
@@ -585,34 +585,35 @@ def handle_plan(
         if history_df is not None:
             update_heikin_ashi_stop(plan, history_df, ts=ts)
 
-        for index, target in enumerate(plan.targets):
-            if index in plan.booked_targets:
-                continue
-
-            if ltp >= target:
-                lot = plan.target_lots[index] if index < len(plan.target_lots) else 0
-                exit_price = target
-                exit_quantity(
-                    plan,
-                    lot,
-                    reason=f"fib target {target}",
-                    order_executor=order_executor,
-                    price=exit_price,
-                    ts=ts,
-                )
-                plan.booked_targets.add(index)
-
         latest_close = float(candle["close"])
+
+        # SL checked first — if triggered, skip targets on this candle
         if latest_close <= plan.active_stop_loss:
-            exit_price = plan.active_stop_loss
             exit_quantity(
                 plan,
                 plan.remaining_lot,
                 reason=f"SL close beyond {plan.active_stop_loss}",
                 order_executor=order_executor,
-                price=exit_price,
+                price=plan.active_stop_loss,
                 ts=ts,
             )
+        else:
+            for index, target in enumerate(plan.targets):
+                if index in plan.booked_targets:
+                    continue
+                if plan.remaining_lot <= 0:
+                    break
+                if ltp >= target:
+                    lot = plan.target_lots[index] if index < len(plan.target_lots) else 0
+                    exit_quantity(
+                        plan,
+                        lot,
+                        reason=f"fib target {target}",
+                        order_executor=order_executor,
+                        price=target,
+                        ts=ts,
+                    )
+                    plan.booked_targets.add(index)
 
         if plan.remaining_lot > 0:
             log(

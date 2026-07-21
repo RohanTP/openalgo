@@ -38,8 +38,7 @@ def apply_config_to_strategy(config: dict) -> None:
     # Float parameters
     for float_key in [
         "PREMIUM_MIN", "PREMIUM_MAX",
-        "BIG_CANDLE_THRESHOLD", "BIG_CANDLE_SL_FIB", "ENTRY_BUFFER", "SL_BUFFER",
-        "ENTRY_TRIGGER_BUFFER",
+        "BIG_CANDLE_THRESHOLD", "BIG_CANDLE_SL_FIB", "ENTRY_BUFFER", "SL_BUFFER", "ENTRY_TRIGGER_BUFFER",
     ]:
         if float_key in config:
             setattr(strat, float_key, float(config[float_key]))
