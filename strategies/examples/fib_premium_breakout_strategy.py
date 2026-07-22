@@ -565,21 +565,23 @@ def handle_plan(
     order_executor: OrderExecutor,
     history_df: pd.DataFrame | None = None,
     is_backtest: bool = False,
+    trade_end_time: dtime | None = None,
 ) -> bool:
     if not plan.entered:
-        use_buffer = is_backtest or env_bool("LIVE_ENTRY_BUFFER_ENABLED", True)
+        past_entry_window = trade_end_time is not None and ts.time() > trade_end_time
+        if not past_entry_window:
+            use_buffer = is_backtest or env_bool("LIVE_ENTRY_BUFFER_ENABLED", True)
 
-        should_enter = False
-        if use_buffer:
-            if plan.entry <= ltp <= plan.entry + ENTRY_TRIGGER_BUFFER:
-                should_enter = True
-        else:
-            if ltp >= plan.entry:
-                should_enter = True
+            should_enter = False
+            if use_buffer:
+                if plan.entry <= ltp <= plan.entry + ENTRY_TRIGGER_BUFFER:
+                    should_enter = True
+            else:
+                if ltp >= plan.entry:
+                    should_enter = True
 
-        if should_enter:
-            enter_price = plan.entry
-            enter_trade(plan, order_executor, price=enter_price, ts=ts)
+            if should_enter:
+                enter_trade(plan, order_executor, price=plan.entry, ts=ts)
 
     if plan.entered:
         if history_df is not None:
@@ -642,6 +644,7 @@ def monitor_plan(plan: TradePlan, order_executor: OrderExecutor) -> bool:
         order_executor=order_executor,
         history_df=df,
         is_backtest=False,
+        trade_end_time=TRADE_END_TIME,
     )
 
 

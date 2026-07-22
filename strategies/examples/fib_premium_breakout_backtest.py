@@ -545,12 +545,13 @@ class back_test:
                     order_executor=backtest_executor,
                     history_df=history_df,
                     is_backtest=True,
+                    trade_end_time=trade_end_time,
                 )
 
                 any_trade_entered = any_trade_entered or entered_now_or_before
 
                 if (
-                    ts.time() == square_off_time
+                    ts.time() >= square_off_time
                     and plan.entered
                     and plan.remaining_lot > 0
                 ):
@@ -725,8 +726,11 @@ def main() -> None:
     
     for config in configs:
         name = config["name"]
+        if config.get("skip", False):
+            print(f"Skipping backtest config: {name}")
+            continue
         print(f"Running backtest config: {name}...")
-        
+
         # Apply config parameters to strat module
         apply_config_to_strategy(config)
         bt = back_test(config, conn)

@@ -1,6 +1,7 @@
 [
     {
       "TODO":"1) handle errors in stratgey 2) during entry add initila stop loss of stoploss - 5 points for safety 3) use high entry buffer so that in backtest when high is used as ltp entry is still made 4) test with diff params mainly range and lots for 5 years",
+      "skip": true,
       "name": "nifty_apr_jul_2026",
       "instrument": "NIFTY",
       "options_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/options/NIFTY",
@@ -29,6 +30,42 @@
       "SL_BUFFER": 0.5,
       "FIB_TARGETS": [1.272, 1.618, 2.0],
       "BOOKING_PCTS": [40, 30, 30],
+      "ALLOW_BOTH_CE_PE": true,
+      "ONE_TRADE_PER_DAY": false,
+
+      "HA_TRAIL_START_TARGET": 1,
+      "HA_TRAIL_DELAY_MINUTES": 2,
+      "STRATEGY_LOG_LEVEL": "INFO"
+    },
+    {
+      "name": "nifty_apr_jul_2026_2lots_wide_range",
+      "instrument": "NIFTY",
+      "options_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/options/NIFTY",
+      "index_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/index/NIFTY.parquet",
+      "range": [
+        {
+          "start": "2026-04-01",
+          "end": "2026-07-18"
+        }
+      ],
+      "output_dir": "./strategies/examples/fib_prem_breakout/backtest_results",
+
+      "SELECT_TIME": "09:07",
+      "REFERENCE_CANDLE_TIME": "09:15",
+      "TRADE_END_TIME": "10:30",
+      "SQUARE_OFF_TIME": "15:15",
+
+      "PREMIUM_MIN": 200,
+      "PREMIUM_MAX": 400,
+      "TOTAL_LOTS": 2,
+      "LOT_SIZE": 75,
+      "BIG_CANDLE_THRESHOLD": 40,
+      "BIG_CANDLE_SL_FIB": 0.55,
+      "ENTRY_BUFFER": 0.05,
+      "ENTRY_TRIGGER_BUFFER": 5,
+      "SL_BUFFER": 0.5,
+      "FIB_TARGETS": [1.272, 1.618, 2.0],
+      "BOOKING_PCTS": [0, 50, 50],
       "ALLOW_BOTH_CE_PE": true,
       "ONE_TRADE_PER_DAY": false,
 
