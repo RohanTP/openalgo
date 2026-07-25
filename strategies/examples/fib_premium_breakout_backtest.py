@@ -6,6 +6,7 @@ Parquet-based backtest runner for the Fibonacci breakout strategy.
 import os
 import sys
 import json
+import hashlib
 import argparse
 from datetime import datetime, date, time as dtime
 import pandas as pd
@@ -675,39 +676,76 @@ class back_test:
 
         return raw_reason
 
+    def build_trading_day_map(self) -> list[dict]:
+        """
+        For each trading day in the date range, assign exactly the nearest expiry
+        whose expiry_date >= trading_day — mirroring what the live strategy does at 09:07.
+        Returns list of {trading_day, expiry_date_str, options_path} sorted by trading_day.
+        """
+        all_expiries = self.get_weekly_expiries()
+
+        # Build expiry → options_path lookup
+        expiry_path_map = {e["expiry"]: e["options_path"] for e in all_expiries}
+        expiry_dates_in_range = [
+            e["expiry"] for e in all_expiries
+            if self.start_date <= e["expiry"] <= self.end_date
+        ]
+        if not expiry_dates_in_range:
+            return []
+
+        # Single query across all parquet files to get distinct (trading_day, expiry) pairs
+        wildcard_path = os.path.join(self.options_parquet, "*.parquet")
+        expiry_list = ", ".join(f"'{e}'" for e in expiry_dates_in_range)
+        query = f"""
+            SELECT DISTINCT
+                trading_day,
+                expiry
+            FROM '{wildcard_path}'
+            WHERE expiry IN ({expiry_list})
+            AND trading_day >= '{self.start_date}'
+            AND trading_day <= '{self.end_date}'
+            ORDER BY trading_day, expiry
+        """
+        df = self.conn.execute(query).df()
+
+        # For each trading_day keep nearest expiry (smallest expiry_date >= trading_day)
+        day_map: dict[str, dict] = {}
+        for _, row in df.iterrows():
+            td = str(row["trading_day"])[:10]
+            exp = str(row["expiry"])[:10]
+            if exp < td:
+                continue  # skip expired contracts
+            if td not in day_map or exp < day_map[td]["expiry_date_str"]:
+                day_map[td] = {
+                    "trading_day": td,
+                    "expiry_date_str": exp,
+                    "expiry_date": datetime.strptime(exp, "%Y-%m-%d").date(),
+                    "options_path": expiry_path_map.get(exp, os.path.join(self.options_parquet, f"{exp}.parquet")),
+                }
+
+        return sorted(day_map.values(), key=lambda x: x["trading_day"])
+
     def run_back_test(self) -> tuple[list[dict], list[dict], list[dict]]:
         all_plans: list[dict] = []
         all_orders: list[dict] = []
         all_skipped_days: list[dict] = []
 
-        weekly_expiries = self.get_weekly_expiries()
+        day_map = self.build_trading_day_map()
 
-        for expiry_info in weekly_expiries:
-            expiry_date_str = expiry_info["expiry"]
-            options_path = expiry_info["options_path"]
+        for entry in day_map:
+            trading_day = entry["trading_day"]
+            expiry_date_str = entry["expiry_date_str"]
+            options_path = entry["options_path"]
 
-            expiry_date = expiry_info.get("expiry_date")
-            if expiry_date is not None:
-                if str(expiry_date) < self.start_date or str(expiry_date) > self.end_date:
-                    continue
-
-            days = self.get_trading_days_for_expiry(
-                options_path=options_path,
-                expiry_date=expiry_date_str,
-            )
-
-            if not days:
-                continue
-
-            week_plans, week_orders, week_skipped = self.run_back_test_week(
+            day_plans, day_orders, day_skipped = self.run_back_test_week(
                 options_path=options_path,
                 expiry_date_str=expiry_date_str,
-                days=days,
+                days=[trading_day],
             )
 
-            all_plans.extend(week_plans)
-            all_orders.extend(week_orders)
-            all_skipped_days.extend(week_skipped)
+            all_plans.extend(day_plans)
+            all_orders.extend(day_orders)
+            all_skipped_days.extend(day_skipped)
 
         return all_plans, all_orders, all_skipped_days
 def main() -> None:
@@ -731,29 +769,46 @@ def main() -> None:
             continue
         print(f"Running backtest config: {name}...")
 
+        # Deterministic hash of the config (excludes metadata keys that don't affect results)
+        hash_keys = {k: v for k, v in config.items() if k not in ("skip", "output_dir", "name", "TODO")}
+        config_hash = hashlib.sha256(
+            json.dumps(hash_keys, sort_keys=True).encode()
+        ).hexdigest()[:12]
+
         # Apply config parameters to strat module
         apply_config_to_strategy(config)
         bt = back_test(config, conn)
 
         plans, orders, skipped_days = bt.run_back_test()
-        
-        # Save output files
-        output_dir = config.get("output_dir", "./backtest_results")
-        test_dir = os.path.join(output_dir, name)
+
+        # Save output files — folder named by hash so identical configs always land in the same place
+        output_dir = "./strategies/examples/fib_prem_breakout/backtest_results"
+        test_dir = os.path.join(output_dir, config_hash)
         os.makedirs(test_dir, exist_ok=True)
-        
+
+        # Write config.json — full snapshot of all keys including metadata
+        config_snapshot = {
+            "name": name,
+            "config_hash": config_hash,
+            **{k: v for k, v in config.items() if k not in ("skip", "TODO")},
+        }
+        config_path = os.path.join(test_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(config_snapshot, f, indent=2)
+        print(f"Saved config to {config_path} (hash={config_hash})")
+
         # Write plans.csv
         plans_df = pd.DataFrame(plans)
         plans_path = os.path.join(test_dir, "plans.csv")
         plans_df.to_csv(plans_path, index=False)
         print(f"Saved plans to {plans_path} ({len(plans_df)} rows)")
-        
+
         # Write orders.csv
         orders_df = pd.DataFrame(orders)
         orders_path = os.path.join(test_dir, "orders.csv")
         orders_df.to_csv(orders_path, index=False)
         print(f"Saved orders to {orders_path} ({len(orders_df)} rows)")
-        
+
         # Write skipped_days.csv
         skipped_df = pd.DataFrame(skipped_days)
         if skipped_df.empty:

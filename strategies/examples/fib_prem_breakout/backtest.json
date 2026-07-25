@@ -12,8 +12,6 @@
           "end": "2026-07-18"
         }
       ],
-      "output_dir": "./strategies/examples/fib_prem_breakout/backtest_results",
-
       "SELECT_TIME": "09:07",
       "REFERENCE_CANDLE_TIME": "09:15",
       "TRADE_END_TIME": "10:30",
@@ -44,12 +42,10 @@
       "index_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/index/NIFTY.parquet",
       "range": [
         {
-          "start": "2026-04-01",
-          "end": "2026-07-18"
+          "start": "2021-05-07",
+          "end": "2026-07-02"
         }
       ],
-      "output_dir": "./strategies/examples/fib_prem_breakout/backtest_results",
-
       "SELECT_TIME": "09:07",
       "REFERENCE_CANDLE_TIME": "09:15",
       "TRADE_END_TIME": "10:30",
@@ -62,7 +58,7 @@
       "BIG_CANDLE_THRESHOLD": 40,
       "BIG_CANDLE_SL_FIB": 0.55,
       "ENTRY_BUFFER": 0.05,
-      "ENTRY_TRIGGER_BUFFER": 5,
+      "ENTRY_TRIGGER_BUFFER": 500,
       "SL_BUFFER": 0.5,
       "FIB_TARGETS": [1.272, 1.618, 2.0],
       "BOOKING_PCTS": [0, 50, 50],
