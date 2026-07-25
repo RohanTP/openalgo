@@ -53,6 +53,7 @@ db/backups/
 !symbols.csv
 !all_symbols.csv
 !data/qtyfreeze.csv
+!strategies/examples/fib_prem_breakout/backtest_results/**/*.csv
 
 # Environments 
 .env 
