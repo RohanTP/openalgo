@@ -166,6 +166,8 @@ class LiveOrderExecutor(OrderExecutor):
     ) -> None:
         if client is None:
             raise RuntimeError("API client is not initialized.")
+        if action == "BUY" and plan.entry_time is None:
+            plan.entry_time = ts or datetime.now()
         response = client.placesmartorder(
             strategy=STRATEGY_NAME,
             symbol=plan.candidate.symbol,
@@ -249,8 +251,10 @@ def get_current_weekly_expiry() -> tuple[str, bool]:
         raise RuntimeError(f"No option expiries found for {UNDERLYING}")
 
     sorted_expiries = sorted(expiries, key=parse_expiry_date)
-    expiry = sorted_expiries[0]
-    expiry_date = parse_expiry_date(expiry).date()
+    expiry_raw = sorted_expiries[0]
+    # optionchain API expects DDMMMYY (e.g. 28JUL26), expiry API returns DD-MMM-YY
+    expiry = expiry_raw.replace("-", "")
+    expiry_date = parse_expiry_date(expiry_raw).date()
     return expiry, expiry_date == datetime.now().date()
 
 
@@ -354,6 +358,8 @@ def fetch_today_history(symbol: str) -> pd.DataFrame:
         start_date=today,
         end_date=today,
     )
+    if isinstance(df, dict):
+        raise RuntimeError(f"History API error for {symbol}: {df.get('message', df)}")
     df = normalize_history(df)
     required_columns = {"open", "high", "low", "close"}
     missing_columns = required_columns - set(df.columns)
@@ -432,7 +438,11 @@ def split_target_lots(total_lots: int) -> list[int]:
 def create_trade_plans(candidates: list[Candidate]) -> list[TradePlan]:
     plans: list[TradePlan] = []
     for candidate in candidates:
-        df = fetch_today_history(candidate.symbol)
+        try:
+            df = fetch_today_history(candidate.symbol)
+        except RuntimeError as e:
+            log(f"Waiting for history data for {candidate.symbol}: {e}", "INFO")
+            continue
         candle = reference_candle(df)
         if candle is None:
             log(f"Waiting for reference candle for {candidate.symbol}", "INFO")
@@ -554,7 +564,7 @@ def update_heikin_ashi_stop(plan: TradePlan, df: pd.DataFrame, ts: datetime | No
     old_sl = plan.active_stop_loss
     plan.active_stop_loss = max(plan.active_stop_loss, trailed_sl)
     if plan.active_stop_loss != old_sl:
-        log(f"{plan.candidate.symbol} HA trail SL updated {old_sl} -> {plan.active_stop_loss}", "DEBUG")
+        log(f"{plan.candidate.symbol} HA trail SL updated {old_sl} -> {plan.active_stop_loss}", "INFO")
 
 
 def handle_plan(
@@ -628,13 +638,23 @@ def handle_plan(
 
 
 def monitor_plan(plan: TradePlan, order_executor: OrderExecutor) -> bool:
-    df = fetch_today_history(plan.candidate.symbol)
+    try:
+        df = fetch_today_history(plan.candidate.symbol)
+    except RuntimeError as e:
+        log(f"Transient history error for {plan.candidate.symbol}, skipping poll: {e}", "INFO")
+        return plan.entered
+
     candles = completed_candles(df)
     if candles.empty:
-        return False
+        return plan.entered
 
     latest = candles.iloc[-1]
-    ltp = fetch_ltp(plan.candidate.symbol)
+
+    try:
+        ltp = fetch_ltp(plan.candidate.symbol)
+    except Exception as e:
+        log(f"Transient LTP error for {plan.candidate.symbol}, skipping poll: {e}", "INFO")
+        return plan.entered
 
     return handle_plan(
         plan=plan,
@@ -690,8 +710,11 @@ def run_strategy() -> None:
         for plan in active_plans:
             if ONE_TRADE_PER_DAY and any_trade_entered and not plan.entered:
                 continue
-            entered_now_or_before = monitor_plan(plan, live_executor)
-            any_trade_entered = any_trade_entered or entered_now_or_before
+            try:
+                entered_now_or_before = monitor_plan(plan, live_executor)
+                any_trade_entered = any_trade_entered or entered_now_or_before
+            except Exception as e:
+                log(f"Error monitoring {plan.candidate.symbol}, skipping poll: {e}", "INFO")
 
         time.sleep(POLL_SECONDS)
 
