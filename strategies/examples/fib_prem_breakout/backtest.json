@@ -1,7 +1,6 @@
 [
     {
       "TODO":"1) handle errors in stratgey 2) during entry add initila stop loss of stoploss - 5 points for safety 3) use high entry buffer so that in backtest when high is used as ltp entry is still made 4) test with diff params mainly range and lots for 5 years",
-      "skip": true,
       "name": "nifty_apr_jul_2026",
       "instrument": "NIFTY",
       "options_parquet": "/Users/rohantp/Desktop/Projects/OpenSourceAlgo/HistoricalData/india-options-data/options/NIFTY",
@@ -30,6 +29,7 @@
       "BOOKING_PCTS": [40, 30, 30],
       "ALLOW_BOTH_CE_PE": true,
       "ONE_TRADE_PER_DAY": false,
+      "MAX_CAPITAL_PER_DAY": 150000,
 
       "HA_TRAIL_START_TARGET": 1,
       "HA_TRAIL_DELAY_MINUTES": 2,
@@ -64,9 +64,10 @@
       "BOOKING_PCTS": [0, 50, 50],
       "ALLOW_BOTH_CE_PE": true,
       "ONE_TRADE_PER_DAY": false,
+      "MAX_CAPITAL_PER_DAY": 150000,
 
       "HA_TRAIL_START_TARGET": 1,
       "HA_TRAIL_DELAY_MINUTES": 2,
       "STRATEGY_LOG_LEVEL": "INFO"
     }
-  ]
+]

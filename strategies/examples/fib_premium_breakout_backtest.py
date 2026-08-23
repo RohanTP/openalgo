@@ -40,6 +40,7 @@ def apply_config_to_strategy(config: dict) -> None:
     for float_key in [
         "PREMIUM_MIN", "PREMIUM_MAX",
         "BIG_CANDLE_THRESHOLD", "BIG_CANDLE_SL_FIB", "ENTRY_BUFFER", "SL_BUFFER", "ENTRY_TRIGGER_BUFFER",
+        "MAX_CAPITAL_PER_DAY",
     ]:
         if float_key in config:
             setattr(strat, float_key, float(config[float_key]))
@@ -152,12 +153,9 @@ class back_test:
             AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) = '{self.select_time_str}'
             LIMIT 1
         """
-
         df = self.conn.execute(query).df()
-
         if df.empty:
             return None
-
         return float(df.iloc[0]["close"])
     
     def get_itm_candidates(
@@ -167,25 +165,16 @@ class back_test:
             trading_day: str,
             spot: float,
         ) -> list:
-            res_options = pd.DataFrame()
-
-            # Try SELECT_TIME first, fallback to 09:15 if 09:07 candle missing
-            for t_str in [self.select_time_str, self.ref_time_str]:
-
-                query = f"""
-                    SELECT symbol, strike, option_type, close AS premium
-                    FROM '{options_path}'
-                    WHERE expiry = '{expiry_date_str}'
-                    AND trading_day = '{trading_day}'
-                    AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) = '{t_str}'
-                    AND close >= {self.premium_min}
-                    AND close <= {self.premium_max}
-                """
-
-                res_options = self.conn.execute(query).df()
-
-                if not res_options.empty:
-                    break
+            query = f"""
+                SELECT symbol, strike, option_type, close AS premium
+                FROM '{options_path}'
+                WHERE expiry = '{expiry_date_str}'
+                AND trading_day = '{trading_day}'
+                AND strftime('%H:%M', timezone('Asia/Kolkata', timestamp)) = '{self.select_time_str}'
+                AND close >= {self.premium_min}
+                AND close <= {self.premium_max}
+            """
+            res_options = self.conn.execute(query).df()
 
             candidates = []
 
@@ -493,6 +482,11 @@ class back_test:
 
         trade_start_time = datetime.strptime("09:16", "%H:%M").time()
 
+        # Reset daily capital ledger from config / strategy default
+        strat.reset_day_capital(
+            float(self.config.get("MAX_CAPITAL_PER_DAY", strat.MAX_CAPITAL_PER_DAY))
+        )
+
         backtest_executor = strat.BacktestOrderExecutor()
         any_trade_entered = False
 
@@ -627,6 +621,8 @@ class back_test:
         plan_orders: list[dict],
     ) -> str:
         if not plan.entered:
+            if getattr(plan, "skip_reason", None) == "NO_CAPITAL":
+                return "NOT_ENTERED_NO_CAPITAL"
             return "NOT_ENTERED"
 
         if plan.remaining_lot > 0:
@@ -686,16 +682,17 @@ class back_test:
 
         # Build expiry → options_path lookup
         expiry_path_map = {e["expiry"]: e["options_path"] for e in all_expiries}
-        expiry_dates_in_range = [
-            e["expiry"] for e in all_expiries
-            if self.start_date <= e["expiry"] <= self.end_date
+        # Include expiries on/after start (may expire after end_date — same as live
+        # nearest-weekly selection, e.g. trade Aug 5 on 11-Aug weekly).
+        expiry_dates_available = [
+            e["expiry"] for e in all_expiries if e["expiry"] >= self.start_date
         ]
-        if not expiry_dates_in_range:
+        if not expiry_dates_available:
             return []
 
         # Single query across all parquet files to get distinct (trading_day, expiry) pairs
         wildcard_path = os.path.join(self.options_parquet, "*.parquet")
-        expiry_list = ", ".join(f"'{e}'" for e in expiry_dates_in_range)
+        expiry_list = ", ".join(f"'{e}'" for e in expiry_dates_available)
         query = f"""
             SELECT DISTINCT
                 trading_day,
@@ -767,13 +764,24 @@ def main() -> None:
         if config.get("skip", False):
             print(f"Skipping backtest config: {name}")
             continue
-        print(f"Running backtest config: {name}...")
 
         # Deterministic hash of the config (excludes metadata keys that don't affect results)
         hash_keys = {k: v for k, v in config.items() if k not in ("skip", "output_dir", "name", "TODO")}
         config_hash = hashlib.sha256(
             json.dumps(hash_keys, sort_keys=True).encode()
         ).hexdigest()[:12]
+
+        output_dir = "./strategies/examples/fib_prem_breakout/backtest_results"
+        test_dir = os.path.join(output_dir, config_hash)
+        orders_path_existing = os.path.join(test_dir, "orders.csv")
+        if os.path.isfile(orders_path_existing):
+            print(
+                f"Skipping backtest config: {name} "
+                f"(results already exist at {test_dir})"
+            )
+            continue
+
+        print(f"Running backtest config: {name}...")
 
         # Apply config parameters to strat module
         apply_config_to_strategy(config)
@@ -782,8 +790,6 @@ def main() -> None:
         plans, orders, skipped_days = bt.run_back_test()
 
         # Save output files — folder named by hash so identical configs always land in the same place
-        output_dir = "./strategies/examples/fib_prem_breakout/backtest_results"
-        test_dir = os.path.join(output_dir, config_hash)
         os.makedirs(test_dir, exist_ok=True)
 
         # Write config.json — full snapshot of all keys including metadata

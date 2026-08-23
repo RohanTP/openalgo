@@ -45,6 +45,9 @@ checkpoints.json
 # Strategy encryption key
 db/strategy_encryption.key
 
+# Live strategy runtime state (candidates/plans resume files)
+strategies/runtime/
+
 # DB backup files (created by upgrade/rotate_pepper.py and other migrations)
 db/backups/
 
